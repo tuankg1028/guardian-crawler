@@ -139,26 +139,38 @@ class GuardianCrawler:
                 if href:
                     url = urljoin(self.base_url, href)
             
-            # Extract date
-            date_selectors = ['.date', '.published', '.time', '[datetime]', '.post-date']
+            # Filter out invalid URLs
+            if not self.is_valid_url(url):
+                return None
+            
+            # Extract date - try datetime attribute first
+            date_selectors = ['[datetime]', '.date', '.published', '.time', '.post-date', 'time']
             date = None
             for sel in date_selectors:
                 date_el = await element.query_selector(sel)
                 if date_el:
+                    # Try datetime attribute first
+                    datetime_attr = await date_el.get_attribute('datetime')
+                    if datetime_attr:
+                        date = self.parse_date(datetime_attr)
+                        if date:
+                            break
+                    
+                    # Fallback to text content
                     date_text = await date_el.inner_text()
                     if date_text:
                         date = self.parse_date(date_text)
                         if date:
                             break
             
-            # Extract excerpt/content preview
-            content_selectors = ['.excerpt', '.summary', '.content', 'p']
+            # Extract excerpt/content preview - avoid short snippets
+            content_selectors = ['.excerpt', '.summary', '.content', 'p', '.lead']
             content = None
             for sel in content_selectors:
                 content_el = await element.query_selector(sel)
                 if content_el:
                     content = await content_el.inner_text()
-                    if content and len(content.strip()) > 20:
+                    if content and len(content.strip()) > 50 and not self.is_author_only(content.strip()):
                         break
             
             return {
@@ -172,37 +184,124 @@ class GuardianCrawler:
         except Exception as e:
             return None
     
+    def is_valid_url(self, url):
+        if not url:
+            return False
+        
+        # Parse URL
+        parsed = urlparse(url)
+        
+        # Must be guardian.co.tt domain
+        if not parsed.netloc.endswith('guardian.co.tt'):
+            return False
+        
+        # Exclude subscription and share URLs
+        excluded_patterns = [
+            '/amember/',
+            '/signup/',
+            'facebook.com/sharer',
+            'twitter.com/share',
+            'mailto:',
+            'javascript:',
+            '/search?',
+            '/tag/',
+            '#',
+        ]
+        
+        for pattern in excluded_patterns:
+            if pattern in url.lower():
+                return False
+        
+        # Must contain actual content indicators
+        valid_patterns = [
+            '/news/',
+            '/sports/',
+            '/entertainment/',
+            '/business/',
+            '/article/',
+            '/opinion/',
+            '-6.2.',  # Guardian article ID pattern
+        ]
+        
+        return any(pattern in url.lower() for pattern in valid_patterns)
+    
+    def is_author_only(self, content):
+        # Check if content is just an author name
+        author_indicators = ['by ', 'author:', 'written by']
+        content_lower = content.lower().strip()
+        
+        # Very short content that starts with author indicators
+        if len(content) < 30 and any(indicator in content_lower for indicator in author_indicators):
+            return True
+        
+        # Single word or very short phrases that look like names
+        words = content.split()
+        if len(words) <= 3 and all(word.istitle() for word in words if word.isalpha()):
+            return True
+            
+        return False
+    
     def parse_date(self, date_string):
         try:
-            # Common date formats
+            date_string = date_string.strip()
+            
+            # Handle ISO format first (common in datetime attributes)
+            iso_patterns = [
+                r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})',
+                r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)',
+                r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)',
+                r'(\d{4}-\d{2}-\d{2})',
+            ]
+            
+            for pattern in iso_patterns:
+                match = re.search(pattern, date_string)
+                if match:
+                    try:
+                        iso_date = match.group(1)
+                        # Handle different ISO formats
+                        if 'T' in iso_date:
+                            if '.' in iso_date:
+                                return datetime.fromisoformat(iso_date.replace('Z', '+00:00'))
+                            else:
+                                return datetime.fromisoformat(iso_date.replace('Z', '+00:00'))
+                        else:
+                            return datetime.strptime(iso_date, '%Y-%m-%d')
+                    except:
+                        continue
+            
+            # Common display date formats
             formats = [
                 '%Y-%m-%d',
                 '%d/%m/%Y',
                 '%m/%d/%Y',
                 '%B %d, %Y',
                 '%d %B %Y',
+                '%b %d, %Y',
+                '%d %b %Y',
                 '%Y-%m-%d %H:%M:%S',
                 '%d/%m/%Y %H:%M',
+                '%m/%d/%Y %H:%M',
             ]
             
             for fmt in formats:
                 try:
-                    return datetime.strptime(date_string.strip(), fmt)
+                    return datetime.strptime(date_string, fmt)
                 except ValueError:
                     continue
                     
-            # Try to extract date with regex
+            # Try to extract date with regex patterns
             date_patterns = [
-                r'(\d{4}-\d{2}-\d{2})',
-                r'(\d{1,2}/\d{1,2}/\d{4})',
-                r'([A-Za-z]+ \d{1,2}, \d{4})',
+                (r'(\d{4}-\d{2}-\d{2})', '%Y-%m-%d'),
+                (r'(\d{1,2}/\d{1,2}/\d{4})', '%d/%m/%Y'),
+                (r'([A-Za-z]+ \d{1,2}, \d{4})', '%B %d, %Y'),
+                (r'(\d{1,2} [A-Za-z]+ \d{4})', '%d %B %Y'),
             ]
             
-            for pattern in date_patterns:
+            for pattern, fmt in date_patterns:
                 match = re.search(pattern, date_string)
                 if match:
                     try:
-                        return datetime.strptime(match.group(1), '%Y-%m-%d')
+                        return datetime.strptime(match.group(1), fmt)
                     except:
                         continue
                         
