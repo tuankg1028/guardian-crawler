@@ -74,21 +74,31 @@ class GuardianCrawler:
             print(f"Error crawling {url}: {e}")
     
     async def handle_infinite_scroll(self, page):
-        """Handle infinite scroll loading"""
+        """Handle infinite scroll loading - more aggressive"""
         try:
             last_height = await page.evaluate("document.body.scrollHeight")
             scroll_attempts = 0
-            max_scrolls = 10  # Limit scrolling to prevent infinite loops
+            max_scrolls = 25  # Increased limit for more content
             
             while scroll_attempts < max_scrolls:
                 # Scroll to bottom
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(1500)  # Slightly faster
                 
                 # Check if new content loaded
                 new_height = await page.evaluate("document.body.scrollHeight")
                 if new_height == last_height:
-                    break
+                    # Try scrolling up and down to trigger lazy loading
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.8)")
+                    await page.wait_for_timeout(1000)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1500)
+                    
+                    final_height = await page.evaluate("document.body.scrollHeight")
+                    if final_height == new_height:
+                        break
+                    else:
+                        new_height = final_height
                 
                 last_height = new_height
                 scroll_attempts += 1
@@ -472,7 +482,7 @@ class GuardianCrawler:
             except Exception as e:
                 continue
         
-        # Try numbered pagination (page 2, 3, 4, etc.)
+        # Try numbered pagination (page 2, 3, 4, etc.) - more aggressive
         try:
             page_links = await page.query_selector_all('a[href*="page"]')
             page_numbers = []
@@ -487,13 +497,41 @@ class GuardianCrawler:
                         page_num = int(match.group(1))
                         page_numbers.append((page_num, urljoin(self.base_url, href)))
             
-            # Sort and visit pages in order
+            # Sort and visit pages in order (increased limit)
             page_numbers.sort()
-            for page_num, url in page_numbers:
+            for page_num, url in page_numbers[:20]:  # Visit up to 20 pages
                 if url not in self.visited_urls:
                     print(f"Following numbered page: {url}")
                     await self.crawl_page(page, url)
-                    await page.wait_for_timeout(2000)  # Be respectful
+                    await page.wait_for_timeout(1000)  # Faster pagination
+        except Exception as e:
+            pass
+        
+        # Try to find "Load More" or infinite scroll buttons
+        try:
+            load_more_selectors = [
+                'button[class*="load-more"]',
+                'a[class*="load-more"]',
+                'button[class*="more"]',
+                '.load-more',
+                '[data-load-more]',
+                'button:contains("Load More")',
+                'a:contains("More")',
+            ]
+            
+            for selector in load_more_selectors:
+                try:
+                    load_more = await page.query_selector(selector)
+                    if load_more:
+                        print("Found load more button, clicking...")
+                        await load_more.click()
+                        await page.wait_for_timeout(3000)
+                        # Re-extract posts after loading more
+                        new_posts = await self.extract_posts(page)
+                        print(f"Found {len(new_posts)} additional posts after load more")
+                        break
+                except:
+                    continue
         except Exception as e:
             pass
         
@@ -503,7 +541,7 @@ class GuardianCrawler:
         # Focus on working URLs and discover pages through navigation
         print("Exploring categories and discovering article pages...")
         
-        # Start with known working sections
+        # Start with known working sections and search patterns
         working_urls = [
             f"{self.base_url}/news",
             f"{self.base_url}/sports", 
@@ -511,6 +549,13 @@ class GuardianCrawler:
             f"{self.base_url}/entertainment",
             f"{self.base_url}/opinion",
             f"{self.base_url}/features",
+            f"{self.base_url}/lifestyle",
+            f"{self.base_url}/community",
+            f"{self.base_url}/politics",
+            f"{self.base_url}/crime",
+            f"{self.base_url}/health",
+            f"{self.base_url}/education",
+            f"{self.base_url}/environment",
         ]
         
         discovered_urls = set()
@@ -521,15 +566,24 @@ class GuardianCrawler:
             await page.goto(self.base_url, wait_until="load")
             await page.wait_for_timeout(3000)
             
-            # Look for all article links on main page
+            # Look for all article links on main page - comprehensive search
             article_link_selectors = [
-                'a[href*="-6.2."]',  # Guardian article pattern
+                'a[href*="-6.2."]',  # Guardian article pattern (most reliable)
                 'a[href*="/news/"]',
                 'a[href*="/sports/"]', 
                 'a[href*="/business/"]',
                 'a[href*="/entertainment/"]',
                 'a[href*="/opinion/"]',
                 'a[href*="/features/"]',
+                'a[href*="/article/"]',
+                'a[href*="/crime/"]',
+                'a[href*="/politics/"]',
+                'a[href*="/health/"]',
+                'a[href*="/education/"]',
+                'a[href*="/lifestyle/"]',
+                'a[href*="/community/"]',
+                'a[href*="/environment/"]',
+                'a',  # All links - will be filtered by is_valid_url
             ]
             
             for selector in article_link_selectors:
@@ -549,26 +603,39 @@ class GuardianCrawler:
         except Exception as e:
             print(f"Error discovering links from main page: {e}")
         
-        # Try the working section URLs
+        # Try the working section URLs with deeper exploration
         for url in working_urls:
             if url not in self.visited_urls:
                 try:
                     print(f"Exploring section: {url}")
                     await self.crawl_page(page, url)
-                    await page.wait_for_timeout(2000)
+                    
+                    # Also try common sub-pages within each section
+                    section_name = url.split('/')[-1]
+                    for page_num in range(2, 11):  # Pages 2-10 for each section
+                        sub_url = f"{url}/page/{page_num}"
+                        if sub_url not in self.visited_urls:
+                            try:
+                                print(f"Exploring {section_name} page {page_num}")
+                                await self.crawl_page(page, sub_url)
+                                await page.wait_for_timeout(1000)
+                            except:
+                                break  # Stop if page doesn't exist
+                    
+                    await page.wait_for_timeout(1000)
                 except Exception as e:
                     print(f"Error accessing section {url}: {e}")
                     continue
         
-        # Process discovered article URLs directly
+        # Process discovered article URLs directly (increased limit)
         processed = 0
         for url in discovered_urls:
-            if url not in self.visited_urls and processed < 50:  # Limit to avoid endless crawling
+            if url not in self.visited_urls and processed < 500:  # Increased limit for more comprehensive crawling
                 try:
                     processed += 1
                     print(f"Crawling discovered article {processed}: {url}")
                     await self.crawl_page(page, url)
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)  # Reduced delay for faster crawling
                 except Exception as e:
                     print(f"Error accessing {url}: {e}")
                     continue
