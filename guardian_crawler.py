@@ -40,7 +40,17 @@ class GuardianCrawler:
             # Handle infinite scroll if present
             await self.handle_infinite_scroll(page)
             
-            # Extract posts from current page
+            # Check if this is an article page itself
+            article_post = await self.extract_article_from_page(page, url)
+            if article_post:
+                if url not in self.visited_urls:
+                    self.visited_urls.add(url)
+                    if self.is_within_date_range(article_post.get('date')):
+                        self.posts.append(article_post)
+                        print(f"Added article: {article_post['title'][:50]}...")
+                        return  # Don't look for more links on article pages
+            
+            # Extract posts from current page (if it's a listing page)
             posts = await self.extract_posts(page)
             
             posts_added = 0
@@ -56,8 +66,9 @@ class GuardianCrawler:
             
             print(f"Found {len(posts)} posts, added {posts_added} new posts from this page")
             
-            # Look for pagination links
-            await self.handle_pagination(page)
+            # Look for pagination links only on listing pages
+            if posts_added > 0 or len(posts) > 0:
+                await self.handle_pagination(page)
             
         except Exception as e:
             print(f"Error crawling {url}: {e}")
@@ -214,6 +225,79 @@ class GuardianCrawler:
             }
             
         except Exception as e:
+            return None
+    
+    async def extract_article_from_page(self, page, url):
+        """Extract article data if this page IS an article (not a listing)"""
+        try:
+            # Check if this looks like an article page
+            if not self.is_valid_url(url):
+                return None
+            
+            # Look for article-specific elements
+            title_selectors = ['h1', 'h1.headline', '[property="headline"]']
+            title = None
+            
+            for sel in title_selectors:
+                title_el = await page.query_selector(sel)
+                if title_el:
+                    title = await title_el.inner_text()
+                    if title and len(title.strip()) > 10:
+                        break
+            
+            if not title:
+                return None
+            
+            # Extract date from meta tags (Guardian specific)
+            date = None
+            try:
+                meta_selectors = [
+                    '[property="dateModified"]',
+                    '[property="datePublished"]',
+                    '[name="dateModified"]',
+                    '[name="datePublished"]'
+                ]
+                
+                for meta_sel in meta_selectors:
+                    meta_el = await page.query_selector(meta_sel)
+                    if meta_el:
+                        content = await meta_el.get_attribute('content')
+                        if content:
+                            print(f"Found article metadata date: {content}")
+                            date = self.parse_date(content)
+                            if date:
+                                break
+            except:
+                pass
+            
+            # Extract article content
+            content_selectors = ['article p', '.content p', '.entry-content p', 'p']
+            content_paragraphs = []
+            
+            for sel in content_selectors:
+                try:
+                    paragraphs = await page.query_selector_all(sel)
+                    for p in paragraphs[:3]:  # First 3 paragraphs
+                        text = await p.inner_text()
+                        if text and len(text.strip()) > 30:
+                            content_paragraphs.append(text.strip())
+                    if content_paragraphs:
+                        break
+                except:
+                    continue
+            
+            content = ' '.join(content_paragraphs) if content_paragraphs else ''
+            
+            return {
+                'title': title.strip(),
+                'url': url,
+                'date': date,
+                'content': content[:500] + '...' if len(content) > 500 else content,
+                'scraped_at': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            print(f"Error extracting article from {url}: {e}")
             return None
     
     def is_valid_url(self, url):
@@ -416,89 +500,75 @@ class GuardianCrawler:
         return False
     
     async def explore_archives(self, page):
-        # Try comprehensive archive exploration
-        print("Exploring archives and categories...")
+        # Focus on working URLs and discover pages through navigation
+        print("Exploring categories and discovering article pages...")
         
-        # Common archive patterns
-        archive_urls = [
-            f"{self.base_url}/archives",
-            f"{self.base_url}/archive",
-            f"{self.base_url}/news/archives",
-            f"{self.base_url}/sitemap",
-            f"{self.base_url}/sitemap.xml",
-            f"{self.base_url}/category/news",
-            f"{self.base_url}/category/sports",
-            f"{self.base_url}/category/entertainment",
-            f"{self.base_url}/category/business",
-            f"{self.base_url}/category/politics",
+        # Start with known working sections
+        working_urls = [
             f"{self.base_url}/news",
-            f"{self.base_url}/sports",
-            f"{self.base_url}/entertainment",
+            f"{self.base_url}/sports", 
             f"{self.base_url}/business",
+            f"{self.base_url}/entertainment",
+            f"{self.base_url}/opinion",
+            f"{self.base_url}/features",
         ]
         
-        # Try year and month-based archives (comprehensive)
-        for year in range(2009, 2025):
-            archive_urls.extend([
-                f"{self.base_url}/{year}",
-                f"{self.base_url}/news/{year}",
-                f"{self.base_url}/archives/{year}",
-                f"{self.base_url}/category/news/{year}",
-            ])
-            
-            # Monthly archives for better coverage
-            for month in range(1, 13):
-                archive_urls.extend([
-                    f"{self.base_url}/{year}/{month:02d}",
-                    f"{self.base_url}/news/{year}/{month:02d}",
-                    f"{self.base_url}/archives/{year}/{month:02d}",
-                ])
+        discovered_urls = set()
         
-        # Try to find category and archive links from the main page
+        # Discover links from main page
         try:
+            print("Discovering links from main page...")
             await page.goto(self.base_url, wait_until="load")
+            await page.wait_for_timeout(3000)
             
-            # Look for archive/category links
-            archive_link_selectors = [
-                'a[href*="archive"]',
-                'a[href*="category"]',
-                'a[href*="news"]',
-                'a[href*="sports"]',
-                'a[href*="20"]',  # Year links
-                '.menu a',
-                '.navigation a',
-                '.nav a',
-                'nav a',
+            # Look for all article links on main page
+            article_link_selectors = [
+                'a[href*="-6.2."]',  # Guardian article pattern
+                'a[href*="/news/"]',
+                'a[href*="/sports/"]', 
+                'a[href*="/business/"]',
+                'a[href*="/entertainment/"]',
+                'a[href*="/opinion/"]',
+                'a[href*="/features/"]',
             ]
             
-            discovered_urls = set()
-            for selector in archive_link_selectors:
+            for selector in article_link_selectors:
                 try:
                     links = await page.query_selector_all(selector)
                     for link in links:
                         href = await link.get_attribute('href')
                         if href:
                             full_url = urljoin(self.base_url, href)
-                            discovered_urls.add(full_url)
+                            if self.is_valid_url(full_url):
+                                discovered_urls.add(full_url)
                 except:
                     continue
-            
-            archive_urls.extend(list(discovered_urls))
+                    
+            print(f"Discovered {len(discovered_urls)} article URLs from main page")
             
         except Exception as e:
-            print(f"Error discovering archive links: {e}")
+            print(f"Error discovering links from main page: {e}")
         
-        # Process all archive URLs
-        total_archives = len(set(archive_urls))
-        processed = 0
-        
-        for url in set(archive_urls):  # Remove duplicates
+        # Try the working section URLs
+        for url in working_urls:
             if url not in self.visited_urls:
                 try:
-                    processed += 1
-                    print(f"Exploring archive {processed}/{total_archives}: {url}")
+                    print(f"Exploring section: {url}")
                     await self.crawl_page(page, url)
-                    await page.wait_for_timeout(1500)  # Be respectful
+                    await page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"Error accessing section {url}: {e}")
+                    continue
+        
+        # Process discovered article URLs directly
+        processed = 0
+        for url in discovered_urls:
+            if url not in self.visited_urls and processed < 50:  # Limit to avoid endless crawling
+                try:
+                    processed += 1
+                    print(f"Crawling discovered article {processed}: {url}")
+                    await self.crawl_page(page, url)
+                    await page.wait_for_timeout(1000)
                 except Exception as e:
                     print(f"Error accessing {url}: {e}")
                     continue
