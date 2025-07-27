@@ -89,8 +89,16 @@ class GuardianCrawler:
     async def extract_posts(self, page):
         posts = []
         
-        # Common selectors for news articles
+        # Guardian-specific and general selectors for news articles
         selectors = [
+            'a[href*="-6.2."]',  # Guardian article pattern (most reliable)
+            'a[href*="/news/"]',
+            'a[href*="/sports/"]',
+            'a[href*="/entertainment/"]',
+            'a[href*="/business/"]',
+            'a[href*="/article/"]',
+            'a[href*="/opinion/"]',
+            'a[href*="/features/"]',
             'article',
             '.post',
             '.entry',
@@ -98,9 +106,6 @@ class GuardianCrawler:
             '.article-item',
             '[class*="post"]',
             '[class*="article"]',
-            'a[href*="/news/"]',
-            'a[href*="/sports/"]',
-            'a[href*="/entertainment/"]'
         ]
         
         for selector in selectors:
@@ -143,25 +148,52 @@ class GuardianCrawler:
             if not self.is_valid_url(url):
                 return None
             
-            # Extract date - try datetime attribute first
-            date_selectors = ['[datetime]', '.date', '.published', '.time', '.post-date', 'time']
+            # Extract date - Guardian-specific and general approaches
             date = None
-            for sel in date_selectors:
-                date_el = await element.query_selector(sel)
-                if date_el:
-                    # Try datetime attribute first
-                    datetime_attr = await date_el.get_attribute('datetime')
-                    if datetime_attr:
-                        date = self.parse_date(datetime_attr)
-                        if date:
-                            break
-                    
-                    # Fallback to text content
-                    date_text = await date_el.inner_text()
-                    if date_text:
-                        date = self.parse_date(date_text)
-                        if date:
-                            break
+            
+            # Try Guardian-specific metadata first
+            try:
+                # Check for property="dateModified" or similar metadata
+                meta_selectors = [
+                    '[property="dateModified"]',
+                    '[property="datePublished"]', 
+                    '[name="dateModified"]',
+                    '[name="datePublished"]'
+                ]
+                
+                for meta_sel in meta_selectors:
+                    meta_el = await page.query_selector(meta_sel)
+                    if meta_el:
+                        content = await meta_el.get_attribute('content')
+                        if content:
+                            print(f"Found metadata date: {content}")
+                            date = self.parse_date(content)
+                            if date:
+                                print(f"Parsed metadata date: {date}")
+                                break
+            except Exception as e:
+                print(f"Error extracting metadata date: {e}")
+                pass
+            
+            # Fallback to element-based date extraction
+            if not date:
+                date_selectors = ['[datetime]', '.date', '.published', '.time', '.post-date', 'time']
+                for sel in date_selectors:
+                    date_el = await element.query_selector(sel)
+                    if date_el:
+                        # Try datetime attribute first
+                        datetime_attr = await date_el.get_attribute('datetime')
+                        if datetime_attr:
+                            date = self.parse_date(datetime_attr)
+                            if date:
+                                break
+                        
+                        # Fallback to text content
+                        date_text = await date_el.inner_text()
+                        if date_text:
+                            date = self.parse_date(date_text)
+                            if date:
+                                break
             
             # Extract excerpt/content preview - avoid short snippets
             content_selectors = ['.excerpt', '.summary', '.content', 'p', '.lead']
@@ -191,21 +223,26 @@ class GuardianCrawler:
         # Parse URL
         parsed = urlparse(url)
         
-        # Must be guardian.co.tt domain
-        if not parsed.netloc.endswith('guardian.co.tt'):
+        # Must be guardian.co.tt domain (reject any other domains)
+        if parsed.netloc != 'www.guardian.co.tt' and parsed.netloc != 'guardian.co.tt':
             return False
         
         # Exclude subscription and share URLs
         excluded_patterns = [
             '/amember/',
             '/signup/',
-            'facebook.com/sharer',
-            'twitter.com/share',
+            'facebook.com',
+            'twitter.com',
             'mailto:',
             'javascript:',
             '/search?',
             '/tag/',
-            '#',
+            '/category/',
+            '/section-',
+            '/live-stream/',
+            '/traffic-cameras/',
+            '/weather/',
+            'undefined',
         ]
         
         for pattern in excluded_patterns:
@@ -220,7 +257,8 @@ class GuardianCrawler:
             '/business/',
             '/article/',
             '/opinion/',
-            '-6.2.',  # Guardian article ID pattern
+            '/features/',
+            '-6.2.',  # Guardian article ID pattern (most reliable)
         ]
         
         return any(pattern in url.lower() for pattern in valid_patterns)
@@ -269,8 +307,9 @@ class GuardianCrawler:
                     except:
                         continue
             
-            # Common display date formats
+            # Common display date formats (including Guardian's format)
             formats = [
+                '%a, %d %b %Y %H:%M:%S %z',  # Guardian format: "Fri, 25 Jul 2025 22:58:41 -0400"
                 '%Y-%m-%d',
                 '%d/%m/%Y',
                 '%m/%d/%Y',
@@ -281,6 +320,7 @@ class GuardianCrawler:
                 '%Y-%m-%d %H:%M:%S',
                 '%d/%m/%Y %H:%M',
                 '%m/%d/%Y %H:%M',
+                '%a, %d %b %Y %H:%M:%S',  # Without timezone
             ]
             
             for fmt in formats:
